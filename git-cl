@@ -216,36 +216,69 @@ class Changelist:
       self.branchref = RunGit(['symbolic-ref', 'HEAD']).strip()
       self.branch = ShortBranchName(self.branchref)
     return self.branch
+
   def GetBranchRef(self):
     """Returns the full branch name, e.g. 'refs/heads/master'."""
     self.GetBranch()  # Poke the lazy loader.
     return self.branchref
 
-  def GetUpstreamBranch(self):
-    if self.upstream_branch is None:
-      branch = self.GetBranch()
-      upstream_branch = RunGit(['config', 'branch.%s.merge' % branch],
+  def FetchUpstreamTuple(self):
+    """Returns a tuple containg remote and remote ref,
+       e.g. 'origin', 'refs/heads/master'
+    """
+    remote = '.'
+    branch = self.GetBranch()
+    upstream_branch = RunGit(['config', 'branch.%s.merge' % branch],
+                             error_ok=True).strip()
+    if upstream_branch:
+      remote = RunGit(['config', 'branch.%s.remote' % branch]).strip()
+    else:
+      upstream_branch = RunGit(['config', 'rietveld.upstream-branch'],
                                error_ok=True).strip()
       if upstream_branch:
-        remote = RunGit(['config', 'branch.%s.remote' % branch]).strip()
-        # We have remote=origin and branch=refs/heads/foobar; convert to
-        # refs/remotes/origin/foobar.
-        self.upstream_branch = upstream_branch.replace('heads',
-                                                       'remotes/' + remote)
-
-      if not self.upstream_branch:
+        remote = RunGit(['config', 'rietveld.upstream-remote']).strip()
+      else:
         # Fall back on trying a git-svn upstream branch.
         if settings.GetIsGitSvn():
-          self.upstream_branch = settings.GetSVNBranch()
-
-      if not self.upstream_branch:
-        DieWithError("""Unable to determine default branch to diff against.
+          upstream_branch = settings.GetSVNBranch()
+        else:
+          # Else, try to guess the origin remote.
+          remote_branches = RunGit(['branch', '-r']).split()
+          if 'origin/master' in remote_branches:
+            # Fall back on origin/master if it exits.
+            remote = 'origin'
+            upstream_branch = 'refs/heads/master'
+          elif 'origin/trunk' in remote_branches:
+            # Fall back on origin/trunk if it exists. Generally a shared
+            # git-svn clone
+            remote = 'origin'
+            upstream_branch = 'refs/heads/trunk'
+          else:
+            DieWithError("""Unable to determine default branch to diff against.
 Either pass complete "git diff"-style arguments, like
   git cl upload origin/master
 or verify this branch is set up to track another (via the --track argument to
 "git checkout -b ...").""")
 
+    return remote, upstream_branch
+
+  def GetUpstreamBranch(self):
+    if self.upstream_branch is None:
+      remote, upstream_branch = self.FetchUpstreamTuple()
+      if remote is not '.':
+        upstream_branch = upstream_branch.replace('heads', 'remotes/' + remote)
+      self.upstream_branch = upstream_branch
     return self.upstream_branch
+
+  def GetRemoteUrl(self):
+    """Return the configured remote URL, e.g. 'git://example.org/foo.git/'.
+
+    Returns None if there is no remote.
+    """
+    remote = self.FetchUpstreamTuple()[0]
+    if remote == '.':
+      return None
+    return RunGit(['config', 'remote.%s.url' % remote], error_ok=True).strip()
 
   def GetIssue(self):
     if not self.has_issue:
@@ -587,8 +620,29 @@ def CmdUpload(args):
       print "Description empty; aborting."
       return 1
     subject = desc.splitlines()[0]
-    upload_args.extend(['--message', subject])
-    upload_args.extend(['--description', desc])
+    upload_args.extend(['--title', subject])
+    upload_args.extend(['--message', desc])
+
+  # Include the upstream repo's URL in the change -- this is useful for
+  # projects that have their source spread across multiple repos.
+  remote_url = None
+  if settings.GetIsGitSvn():
+    # URL is dependent on the current directory.
+    data = RunGit(['svn', 'info'], cwd=settings.GetRoot())
+    if data:
+      keys = dict(line.split(': ', 1) for line in data.splitlines()
+                  if ': ' in line)
+      remote_url = keys.get('URL', None)
+  else:
+    if cl.GetRemoteUrl() and '/' in cl.GetUpstreamBranch():
+      remote_url = (cl.GetRemoteUrl() + '/tree/'
+                    + cl.GetUpstreamBranch().split('/')[-1])
+      remote_url = remote_url.replace("git+ssh://", "http://")
+      remote_url = remote_url.replace("git://", "http://")
+      remote_url = remote_url.replace(".git", "")
+  if remote_url:
+    upload_args.extend(['--base_url', remote_url])
+
   issue, patchset = upload.RealMain(['upload'] + upload_args + args)
   if not cl.GetIssue():
     cl.SetIssue(issue)
